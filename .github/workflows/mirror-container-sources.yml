@@ -71,17 +71,25 @@ jobs:
           marker="Managed by $org/Cron; upstream: $SOURCE_URL"
 
           git init --bare source.git
-          git -C source.git fetch --no-tags "$SOURCE_URL" \
-            '+refs/heads/*:refs/heads/*' \
-            '+refs/tags/*:refs/tags/*'
+          fetched=false
+          for attempt in 1 2 3; do
+            if git -c protocol.version=1 -C source.git fetch --atomic --no-tags \
+              "$SOURCE_URL" '+refs/heads/*:refs/heads/*' \
+              '+refs/tags/*:refs/tags/*'; then
+              fetched=true
+              break
+            fi
+            sleep "$((attempt * 10))"
+          done
+          if [ "$fetched" != true ]; then
+            echo "Could not fetch $SOURCE_URL after three attempts." >&2
+            exit 1
+          fi
 
-          git ls-remote --refs --heads --tags "$SOURCE_URL" \
-            | awk '{print $1, $2}' | sort > upstream-refs.txt
           git -C source.git for-each-ref \
             --format='%(objectname) %(refname)' refs/heads refs/tags \
             | sort > local-refs.txt
           test -s local-refs.txt
-          diff -u upstream-refs.txt local-refs.txt
 
           if description=$(gh api "repos/$org/$SOURCE_NAME" --jq '.description // ""' 2>/dev/null); then
             if [ "$description" != "$marker" ]; then
@@ -98,17 +106,91 @@ jobs:
             -F enabled=false --silent
 
           auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
-          GIT_CONFIG_COUNT=1 \
-          GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
-          GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
-            git -C source.git push --mirror "$target"
+          push_ref() {
+            GIT_CONFIG_COUNT=2 \
+            GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+            GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
+            GIT_CONFIG_KEY_1=http.version \
+            GIT_CONFIG_VALUE_1=HTTP/1.1 \
+              git -C source.git push --force "$target" "$1:$2"
+          }
 
-          default_ref=$(git ls-remote --symref "$SOURCE_URL" HEAD \
-            | awk '$1 == "ref:" && $3 == "HEAD" {print $2}')
+          git ls-remote --refs --heads --tags "$target" \
+            | awk '{print $1, $2}' | sort > previous-refs.txt
+          declare -A previous_refs=()
+          while read -r oid ref; do
+            previous_refs["$ref"]="$oid"
+          done < previous-refs.txt
+
+          # Send each ref separately. If one branch is too large for GitHub's
+          # 2 GiB push limit, recursively send commits along its history.
+          push_commits() {
+            local first=$1 last=$2 destination=$3 middle attempt
+            if push_ref "${commits[$last]}" "$destination"; then
+              sleep 10
+              return 0
+            fi
+            if (( first == last )); then
+              for attempt in 2 3; do
+                sleep "$((attempt * 15))"
+                if push_ref "${commits[$last]}" "$destination"; then
+                  sleep 10
+                  return 0
+                fi
+              done
+              echo "Failed to push commit ${commits[$last]} to $destination." >&2
+              return 1
+            fi
+            middle=$(((first + last) / 2))
+            push_commits "$first" "$middle" "$destination"
+            push_commits "$((middle + 1))" "$last" "$destination"
+          }
+
+          while read -r oid ref; do
+            [[ "$ref" == refs/heads/* ]] || continue
+            [[ "${previous_refs[$ref]:-}" == "$oid" ]] && continue
+            mapfile -t commits < <(git -C source.git rev-list --topo-order --reverse "$ref")
+            test "${#commits[@]}" -gt 0
+            push_commits 0 "$((${#commits[@]} - 1))" "$ref"
+          done < local-refs.txt
+
+          while read -r oid ref; do
+            [[ "$ref" == refs/tags/* ]] || continue
+            [[ "${previous_refs[$ref]:-}" == "$oid" ]] && continue
+            pushed=false
+            for attempt in 1 2 3; do
+              if push_ref "$ref" "$ref"; then
+                pushed=true
+                sleep 10
+                break
+              fi
+              sleep "$((attempt * 15))"
+            done
+            test "$pushed" = true
+          done < local-refs.txt
+
+          default_ref=$(git -c protocol.version=1 ls-remote --symref "$SOURCE_URL" HEAD \
+            | awk '$1 == "ref:" && $3 == "HEAD" {print $2}' || true)
+          if [ -z "$default_ref" ]; then
+            for candidate in main master; do
+              if git -C source.git show-ref --verify --quiet "refs/heads/$candidate"; then
+                default_ref="refs/heads/$candidate"
+                break
+              fi
+            done
+          fi
           if [[ "$default_ref" == refs/heads/* ]]; then
             gh api -X PATCH "repos/$org/$SOURCE_NAME" \
               -f "default_branch=${default_ref#refs/heads/}" --silent
           fi
+
+          # Delete refs removed upstream only after all current refs arrived.
+          while read -r oid ref; do
+            if ! git -C source.git show-ref --verify --quiet "$ref"; then
+              push_ref '' "$ref"
+              sleep 10
+            fi
+          done < previous-refs.txt
 
           git ls-remote --refs --heads --tags "$target" \
             | awk '{print $1, $2}' | sort > target-refs.txt
