@@ -56,13 +56,13 @@ jobs:
         if: ${{ github.event_name == 'schedule' || inputs.source == 'all' || inputs.source == matrix.name }}
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.MIRROR_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN}}
           SOURCE_NAME: ${{ matrix.name }}
           SOURCE_URL: ${{ matrix.upstream }}
         run: |
           set -euo pipefail
           if [ -z "${GH_TOKEN:-}" ]; then
-            echo 'MIRROR_TOKEN repository secret is required.' >&2
+            echo 'GH_TOKEN repository secret is required.' >&2
             exit 1
           fi
 
@@ -113,4 +113,3 @@ jobs:
           git ls-remote --refs --heads --tags "$target" \
             | awk '{print $1, $2}' | sort > target-refs.txt
           diff -u local-refs.txt target-refs.txt
-
