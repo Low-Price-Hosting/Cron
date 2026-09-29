@@ -33,7 +33,7 @@ jobs:
       matrix:
         include:
           - name: Ubuntu
-            upstream: https://git.launchpad.net/cloud-images/+oci/ubuntu-base
+            upstream: https://git.launchpad.net/livecd-rootfs
           - name: Debian
             upstream: https://github.com/debuerreotype/docker-debian-artifacts.git
           - name: Centos
@@ -139,6 +139,63 @@ jobs:
           while read -r oid ref; do
             previous_refs["$ref"]="$oid"
           done < previous-refs.txt
+
+          # Ubuntu's livecd-rootfs repository contains build code, not rootfs
+          # archives. Its many branches and tags fit in a small Git pack, so
+          # update refs in batches instead of walking every commit separately.
+          if [ "$SOURCE_NAME" = Ubuntu ]; then
+            refspecs=()
+            push_batch() {
+              local attempt
+              for attempt in 1 2 3; do
+                if GIT_CONFIG_COUNT=2 \
+                   GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+                   GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
+                   GIT_CONFIG_KEY_1=http.version \
+                   GIT_CONFIG_VALUE_1=HTTP/1.1 \
+                     git -C source.git push "$target" "${refspecs[@]}"; then
+                  refspecs=()
+                  sleep 10
+                  return 0
+                fi
+                sleep "$((attempt * 15))"
+              done
+              echo 'Could not update Ubuntu refs.' >&2
+              return 1
+            }
+
+            while read -r oid ref; do
+              if [ "${previous_refs[$ref]:-}" != "$oid" ]; then
+                refspecs+=("+$ref:$ref")
+                if (( ${#refspecs[@]} == 100 )); then
+                  push_batch
+                fi
+              fi
+            done < local-refs.txt
+            if (( ${#refspecs[@]} )); then
+              push_batch
+            fi
+
+            gh api -X PATCH "repos/$org/$SOURCE_NAME" \
+              -f default_branch=ubuntu/master --silent
+
+            while read -r oid ref; do
+              if ! git -C source.git show-ref --verify --quiet "$ref"; then
+                refspecs+=(":$ref")
+                if (( ${#refspecs[@]} == 100 )); then
+                  push_batch
+                fi
+              fi
+            done < previous-refs.txt
+            if (( ${#refspecs[@]} )); then
+              push_batch
+            fi
+
+            git ls-remote --refs --heads --tags "$target" \
+              | awk '{print $1, $2}' | sort > target-refs.txt
+            diff -u local-refs.txt target-refs.txt
+            exit 0
+          fi
 
           # Send each ref separately. If one branch is too large for GitHub's
           # 2 GiB push limit, recursively send commits along its history.
