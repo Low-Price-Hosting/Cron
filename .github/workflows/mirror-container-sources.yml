@@ -71,19 +71,32 @@ jobs:
           marker="Managed by $org/Cron; upstream: $SOURCE_URL"
 
           git init --bare source.git
-          fetched=false
-          for attempt in 1 2 3; do
-            if git -c protocol.version=1 -C source.git fetch --atomic --no-tags \
-              "$SOURCE_URL" '+refs/heads/*:refs/heads/*' \
-              '+refs/tags/*:refs/tags/*'; then
-              fetched=true
-              break
-            fi
-            sleep "$((attempt * 10))"
-          done
-          if [ "$fetched" != true ]; then
-            echo "Could not fetch $SOURCE_URL after three attempts." >&2
-            exit 1
+          if ! timeout 20m git -c protocol.version=1 -C source.git fetch \
+            --atomic --no-tags "$SOURCE_URL" \
+            '+refs/heads/*:refs/heads/*' '+refs/tags/*:refs/tags/*'; then
+            echo 'Full fetch failed; fetching upstream refs individually.' >&2
+            git -c protocol.version=1 ls-remote --refs --heads --tags \
+              "$SOURCE_URL" | awk '{print $2}' > upstream-refnames.txt
+            test -s upstream-refnames.txt
+            while read -r ref; do
+              fetched=false
+              for attempt in 1 2 3; do
+                if timeout 10m git -c protocol.version=1 -C source.git \
+                  fetch --atomic --no-tags "$SOURCE_URL" "+$ref:$ref"; then
+                  fetched=true
+                  break
+                fi
+                sleep "$((attempt * 10))"
+              done
+              if [ "$fetched" != true ]; then
+                echo "Could not fetch $ref from $SOURCE_URL." >&2
+                exit 1
+              fi
+            done < upstream-refnames.txt
+            git -C source.git for-each-ref --format='%(refname)' \
+              refs/heads refs/tags | sort > local-refnames.txt
+            sort -o upstream-refnames.txt upstream-refnames.txt
+            diff -u upstream-refnames.txt local-refnames.txt
           fi
 
           git -C source.git for-each-ref \
