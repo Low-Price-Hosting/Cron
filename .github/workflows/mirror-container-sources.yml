@@ -45,7 +45,7 @@ jobs:
           - name: AlmaLinux
             upstream: https://github.com/AlmaLinux/container-images.git
           - name: ArchLinux
-            upstream: https://gitlab.archlinux.org/archlinux/archlinux-docker.git
+            upstream: https://github.com/archlinux/archlinux-docker.git
           - name: RockyLinux
             upstream: https://github.com/rocky-linux/sig-cloud-instance-images.git
     concurrency:
@@ -106,8 +106,13 @@ jobs:
 
           if description=$(gh api "repos/$org/$SOURCE_NAME" --jq '.description // ""' 2>/dev/null); then
             if [ "$description" != "$marker" ]; then
-              echo "$org/$SOURCE_NAME exists but is not a Cron-managed mirror." >&2
-              exit 1
+              if [[ "$description" == "Managed by $org/Cron; upstream: "* ]]; then
+                gh api -X PATCH "repos/$org/$SOURCE_NAME" \
+                  -f "description=$marker" --silent
+              else
+                echo "$org/$SOURCE_NAME exists but is not a Cron-managed mirror." >&2
+                exit 1
+              fi
             fi
           else
             gh api -X POST "orgs/$org/repos" \
