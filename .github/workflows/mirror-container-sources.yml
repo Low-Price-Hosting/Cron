@@ -1,0 +1,116 @@
+name: Mirror Linux container sources
+
+on:
+  schedule:
+    - cron: '23 3 * * *'
+  workflow_dispatch:
+    inputs:
+      source:
+        type: choice
+        required: true
+        default: all
+        options:
+          - all
+          - Ubuntu
+          - Debian
+          - Centos
+          - Alpine
+          - Fedora
+          - AlmaLinux
+          - ArchLinux
+          - RockyLinux
+
+permissions:
+  contents: read
+
+jobs:
+  mirror:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - name: Ubuntu
+            upstream: https://git.launchpad.net/cloud-images/+oci/ubuntu-base
+          - name: Debian
+            upstream: https://github.com/debuerreotype/docker-debian-artifacts.git
+          - name: Centos
+            upstream: https://pagure.io/centos-sig-hyperscale/containers-releng.git
+          - name: Alpine
+            upstream: https://github.com/alpinelinux/docker-alpine.git
+          - name: Fedora
+            upstream: https://github.com/fedora-cloud/docker-brew-fedora.git
+          - name: AlmaLinux
+            upstream: https://github.com/AlmaLinux/container-images.git
+          - name: ArchLinux
+            upstream: https://gitlab.archlinux.org/archlinux/archlinux-docker.git
+          - name: RockyLinux
+            upstream: https://github.com/rocky-linux/sig-cloud-instance-images.git
+    concurrency:
+      group: mirror-${{ matrix.name }}
+      cancel-in-progress: false
+    steps:
+      - name: Mirror ${{ matrix.name }}
+        if: ${{ github.event_name == 'schedule' || inputs.source == 'all' || inputs.source == matrix.name }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.MIRROR_TOKEN }}
+          SOURCE_NAME: ${{ matrix.name }}
+          SOURCE_URL: ${{ matrix.upstream }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo 'MIRROR_TOKEN repository secret is required.' >&2
+            exit 1
+          fi
+
+          org=Low-Price-Hosting
+          target="https://github.com/$org/$SOURCE_NAME.git"
+          marker="Managed by $org/Cron; upstream: $SOURCE_URL"
+
+          git init --bare source.git
+          git -C source.git fetch --no-tags "$SOURCE_URL" \
+            '+refs/heads/*:refs/heads/*' \
+            '+refs/tags/*:refs/tags/*'
+
+          git ls-remote --refs --heads --tags "$SOURCE_URL" \
+            | awk '{print $1, $2}' | sort > upstream-refs.txt
+          git -C source.git for-each-ref \
+            --format='%(objectname) %(refname)' refs/heads refs/tags \
+            | sort > local-refs.txt
+          test -s local-refs.txt
+          diff -u upstream-refs.txt local-refs.txt
+
+          if description=$(gh api "repos/$org/$SOURCE_NAME" --jq '.description // ""' 2>/dev/null); then
+            if [ "$description" != "$marker" ]; then
+              echo "$org/$SOURCE_NAME exists but is not a Cron-managed mirror." >&2
+              exit 1
+            fi
+          else
+            gh api -X POST "orgs/$org/repos" \
+              -f "name=$SOURCE_NAME" -f "description=$marker" \
+              -F private=false -F auto_init=false --silent
+          fi
+
+          gh api -X PUT "repos/$org/$SOURCE_NAME/actions/permissions" \
+            -F enabled=false --silent
+
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          GIT_CONFIG_COUNT=1 \
+          GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+          GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
+            git -C source.git push --mirror "$target"
+
+          default_ref=$(git ls-remote --symref "$SOURCE_URL" HEAD \
+            | awk '$1 == "ref:" && $3 == "HEAD" {print $2}')
+          if [[ "$default_ref" == refs/heads/* ]]; then
+            gh api -X PATCH "repos/$org/$SOURCE_NAME" \
+              -f "default_branch=${default_ref#refs/heads/}" --silent
+          fi
+
+          git ls-remote --refs --heads --tags "$target" \
+            | awk '{print $1, $2}' | sort > target-refs.txt
+          diff -u local-refs.txt target-refs.txt
+
