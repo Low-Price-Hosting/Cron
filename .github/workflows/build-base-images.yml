@@ -1,0 +1,250 @@
+name: Build Linux base images
+
+on:
+  workflow_run:
+    workflows: [Mirror Linux container sources]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      distribution:
+        description: Distribution to build
+        type: choice
+        required: true
+        default: all
+        options: [all, Ubuntu, Debian, Centos, Alpine, Fedora, AlmaLinux, ArchLinux, RockyLinux]
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: base-images
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        distribution: [Ubuntu, Debian, Centos, Alpine, Fedora, AlmaLinux, ArchLinux, RockyLinux]
+    steps:
+      - name: Set up Docker Buildx
+        if: github.event_name == 'workflow_run' || inputs.distribution == 'all' || inputs.distribution == matrix.distribution
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name == 'workflow_run' || inputs.distribution == 'all' || inputs.distribution == matrix.distribution
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish ${{ matrix.distribution }}
+        if: github.event_name == 'workflow_run' || inputs.distribution == 'all' || inputs.distribution == matrix.distribution
+        shell: bash
+        env:
+          DISTRIBUTION: ${{ matrix.distribution }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          org=Low-Price-Hosting
+          lower=$(printf '%s' "$DISTRIBUTION" | tr '[:upper:]' '[:lower:]')
+          image="ghcr.io/low-price-hosting/$lower"
+          mirror="https://github.com/$org/$DISTRIBUTION.git"
+          source_label="https://github.com/$org/$DISTRIBUTION"
+          cd "$RUNNER_TEMP"
+
+          # Keep one immutable tag per source revision. Moving version tags do not
+          # require another build when an hourly mirror run finds no new content.
+          publish() {
+            local version=$1 revision=$2 context=$3 dockerfile=$4; shift 4
+            local immutable="${version}-sha${revision:0:12}"
+            if ! docker buildx imagetools inspect "$image:$immutable" >/dev/null 2>&1; then
+              docker buildx build --progress=plain --platform linux/amd64 \
+                --label "org.opencontainers.image.source=$source_label" \
+                --label "org.opencontainers.image.revision=$revision" \
+                --file "$dockerfile" --tag "$image:$immutable" --push "$context"
+            else
+              echo "$image:$immutable already exists; skipping build."
+            fi
+            local alias
+            for alias in "$version" "$@"; do
+              docker buildx imagetools create --tag "$image:$alias" "$image:$immutable"
+            done
+          }
+
+          clone_branch() {
+            local branch=$1 sparse=${2:-}
+            rm -rf source
+            git clone --quiet --depth=1 --filter=blob:none --single-branch \
+              --branch "$branch" --sparse "$mirror" source
+            if [[ -n "$sparse" ]]; then
+              git -C source sparse-checkout set "$sparse"
+            else
+              git -C source sparse-checkout disable
+            fi
+          }
+
+          branches() {
+            git ls-remote --heads "$mirror" | sed 's#.*refs/heads/##'
+          }
+
+          case "$DISTRIBUTION" in
+            Alpine)
+              mapfile -t releases < <(branches | grep -E '^v3\.[0-9]+$' | sort -V | tail -n 3)
+              ((${#releases[@]}))
+              for branch in "${releases[@]}"; do
+                clone_branch "$branch" x86_64
+                [[ -f source/x86_64/Dockerfile ]] || continue
+                version=$(cat source/VERSION)
+                revision=$(git -C source rev-parse HEAD)
+                minor=${version%.*}
+                aliases=()
+                [[ "$branch" == "${releases[-1]}" ]] && aliases+=(latest 3)
+                publish "$version" "$revision" source/x86_64 source/x86_64/Dockerfile "$minor" "${aliases[@]}"
+              done
+              ;;
+            Debian)
+              git clone --quiet --depth=1 --filter=blob:none --single-branch \
+                --branch dist-amd64 --sparse "$mirror" source
+              mapfile -t suites < source/suites
+              for suite in "${suites[@]}"; do
+                case "$suite" in experimental|rc-buggy) continue;; esac
+                clone_branch dist-amd64 "$suite"
+                [[ -f "source/$suite/Dockerfile" ]] || continue
+                revision=$(git -C source rev-parse HEAD)
+                aliases=()
+                [[ "$suite" == stable ]] && aliases+=(latest)
+                publish "$suite" "$revision" "source/$suite" "source/$suite/Dockerfile" "${aliases[@]}"
+              done
+              ;;
+            Fedora)
+              mapfile -t releases < <(branches | grep -E '^[0-9]+$' | sort -n | tail -n 4)
+              ((${#releases[@]}))
+              last_release=
+              for branch in "${releases[@]}"; do
+                clone_branch "$branch" x86_64
+                [[ -f source/x86_64/Dockerfile ]] || continue
+                revision=$(git -C source rev-parse HEAD)
+                publish "$branch" "$revision" source/x86_64 source/x86_64/Dockerfile
+                last_release=$branch
+              done
+              [[ -n "$last_release" ]]
+              docker buildx imagetools create --tag "$image:latest" "$image:$last_release"
+              ;;
+            AlmaLinux)
+              mapfile -t releases < <(branches | grep -E '^[0-9]+$' | sort -n)
+              ((${#releases[@]}))
+              for branch in "${releases[@]}"; do
+                clone_branch "$branch" default/amd64
+                [[ -f source/default/amd64/Dockerfile ]] || continue
+                revision=$(git -C source rev-parse HEAD)
+                mapfile -t aliases < <(sed -n 's/^# Tags: //p' source/default/amd64/Dockerfile | head -n 1 | tr ',' '\n' | xargs -n1)
+                ((${#aliases[@]}))
+                publish "$branch" "$revision" source/default/amd64 source/default/amd64/Dockerfile "${aliases[@]}"
+              done
+              ;;
+            ArchLinux)
+              clone_branch releases
+              revision=$(git -C source rev-parse HEAD)
+              version=$(sed -n 's/^LABEL org.opencontainers.image.version="\([^"]*\)"/\1/p' source/Dockerfile.base | head -n 1)
+              [[ -n "$version" ]]
+              publish "$version" "$revision" source source/Dockerfile.base latest base
+              ;;
+            RockyLinux)
+              mapfile -t releases < <(branches | grep -E '^Rocky-[0-9]+\.[0-9]+\.[0-9]+-Base-x86_64$' | sort -V)
+              ((${#releases[@]}))
+              declare -A newest=()
+              for branch in "${releases[@]}"; do
+                major=${branch#Rocky-}; major=${major%%.*}
+                newest[$major]=$branch
+              done
+              for major in "${!newest[@]}"; do
+                branch=${newest[$major]}
+                clone_branch "$branch"
+                [[ -f source/Dockerfile ]]
+                revision=$(git -C source rev-parse HEAD)
+                full=${branch#Rocky-}; full=${full%-Base-x86_64}
+                minor=${full%.*}
+                publish "$full" "$revision" source source/Dockerfile "$minor" "$major"
+              done
+              latest_major=$(printf '%s\n' "${!newest[@]}" | sort -n | tail -n 1)
+              docker buildx imagetools create --tag "$image:latest" "$image:$latest_major"
+              ;;
+            Ubuntu)
+              # Ubuntu's official container source is ubuntu-base. The current
+              # Ubuntu Git mirror contains livecd-rootfs, which has no Dockerfile.
+              source_label=https://git.launchpad.net/cloud-images/+oci/ubuntu-base
+              curl -fsSL https://raw.githubusercontent.com/docker-library/official-images/master/library/ubuntu > ubuntu-library
+              mapfile -t releases < <(awk 'BEGIN {RS=""; FS="\n"} {tags=""; ref=""; for(i=1;i<=NF;i++) {if($i ~ /^Tags: /) {tags=$i; sub(/^Tags: /, "", tags)} if($i ~ /^amd64-GitFetch: /) {ref=$i; sub(/^amd64-GitFetch: /, "", ref)}} if(tags != "" && ref != "") print tags "|" ref}' ubuntu-library)
+              ((${#releases[@]}))
+              for entry in "${releases[@]}"; do
+                tags=${entry%%|*}; ref=${entry#*|}
+                tag=${ref#refs/tags/}
+                rm -rf source context
+                git clone --quiet --depth=1 --filter=blob:none --branch "$tag" --sparse \
+                  https://git.launchpad.net/cloud-images/+oci/ubuntu-base source
+                git -C source sparse-checkout set oci
+                revision=$(git -C source rev-parse HEAD)
+                manifest=$(jq -r '.manifests[0].digest | sub("^sha256:"; "")' source/oci/index.json)
+                manifest_file="source/oci/blobs/sha256/$manifest"
+                mkdir context
+                printf 'FROM scratch\n' > context/Dockerfile
+                layer_index=0
+                while IFS=$'\t' read -r media_type digest; do
+                  [[ "$media_type" == application/vnd.oci.image.layer.v1.tar+gzip ]]
+                  layer=${digest#sha256:}
+                  layer_file="source/oci/blobs/sha256/$layer"
+                  tar -tf "$layer_file" > layer-contents.txt
+                  if grep -Eq '(^|/)\.wh\.' layer-contents.txt; then
+                    echo 'OCI whiteout layer requires a native OCI import.' >&2
+                    exit 1
+                  fi
+                  cp "$layer_file" "context/layer-$layer_index.tar.gz"
+                  printf 'ADD layer-%s.tar.gz /\n' "$layer_index" >> context/Dockerfile
+                  layer_index=$((layer_index + 1))
+                done < <(jq -r '.layers[] | [.mediaType, .digest] | @tsv' "$manifest_file")
+                ((layer_index > 0))
+                config=$(jq -r '.config.digest | sub("^sha256:"; "")' "$manifest_file")
+                jq -r '.config.Env[]? | "ENV " + .' "source/oci/blobs/sha256/$config" >> context/Dockerfile
+                jq -r '.config.Cmd | "CMD " + tojson' "source/oci/blobs/sha256/$config" >> context/Dockerfile
+                IFS=',' read -ra aliases <<< "$tags"
+                for i in "${!aliases[@]}"; do aliases[$i]="${aliases[$i]// /}"; done
+                publish "${aliases[0]}" "$revision" context context/Dockerfile "${aliases[@]:1}"
+              done
+              ;;
+            Centos)
+              # The mirrored Hyperscale SIG source is not the general CentOS
+              # Stream base image. Build from the project's cloud rootfs.
+              source_label=https://cloud.centos.org/centos/
+              mapfile -t releases < <(curl -fsSL https://cloud.centos.org/centos/ \
+                | sed -nE 's/.*href="([0-9]+)-stream\/".*/\1/p' | sort -n)
+              ((${#releases[@]}))
+              latest_major=
+              for major in "${releases[@]}"; do
+                ((major >= 9)) || continue
+                base="https://cloud.centos.org/centos/$major-stream/x86_64/images"
+                archive="CentOS-Stream-Container-Base-$major-latest.x86_64.tar.xz"
+                if ! curl -fsIL "$base/$archive" >/dev/null; then
+                  continue
+                fi
+                rm -rf context
+                mkdir context
+                curl -fLsS --retry 3 "$base/$archive" -o context/rootfs.tar.xz
+                curl -fLsS --retry 3 "$base/$archive.SHA256SUM" -o context/checksum
+                expected=$(grep '^SHA256 ' context/checksum | sed -E 's/^.* = ([[:xdigit:]]{64})$/\1/' | head -n 1)
+                actual=$(sha256sum context/rootfs.tar.xz | awk '{print $1}')
+                [[ "$actual" == "$expected" ]]
+                printf 'FROM scratch\nADD rootfs.tar.xz /\nCMD ["/bin/bash"]\n' > context/Dockerfile
+                publish "stream$major" "$actual" context context/Dockerfile
+                latest_major=$major
+              done
+              [[ -n "$latest_major" ]]
+              docker buildx imagetools create --tag "$image:latest" "$image:stream$latest_major"
+              ;;
+          esac
