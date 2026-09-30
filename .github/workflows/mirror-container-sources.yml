@@ -232,19 +232,34 @@ jobs:
           org=Low-Price-Hosting
           name=Ubuntu
           target="https://github.com/$org/$name.git"
-          marker="Managed by $org/Cron; upstream: $SOURCE_URL"
+          marker="Managed by $org/Cron; upstream: $SOURCE_URL; scope: current official OCI tags"
 
-          # This repository contains OCI layers in Git. Fetching every ref in
-          # one checkout exceeds the standard runner's available disk space.
+          # The Ubuntu Git repository also holds large historical OCI layers.
+          # Follow every published architecture ref in the official Docker
+          # library manifest, including releases added after this workflow.
+          curl -fsSL --retry 3 \
+            https://raw.githubusercontent.com/docker-library/official-images/master/library/ubuntu \
+            -o ubuntu-library
+          awk '$1 ~ /^[[:alnum:]]+-GitFetch:$/ && $2 ~ /^refs\/tags\// { print $2 }' \
+            ubuntu-library | sort -u > active-tags.txt
+          test -s active-tags.txt
+          default_ref=refs/heads/main
+          { printf '%s\n' "$default_ref"; cat active-tags.txt; } \
+            | sort -u > selected-refs.txt
           git -c protocol.version=1 ls-remote --refs --heads --tags "$SOURCE_URL" \
-            | awk '{print $1, $2}' | sort > upstream-refs.txt
+            | awk '{print $1, $2}' | sort > all-upstream-refs.txt
+          awk 'NR == FNR { wanted[$1] = 1; next }
+            $2 in wanted { print $1, $2; found[$2] = 1 }
+            END {
+              for (ref in wanted) {
+                if (!(ref in found)) {
+                  print "Missing official Ubuntu ref: " ref > "/dev/stderr"
+                  missing = 1
+                }
+              }
+              exit missing
+            }' selected-refs.txt all-upstream-refs.txt | sort > upstream-refs.txt
           test -s upstream-refs.txt
-          default_ref=$(git -c protocol.version=1 ls-remote --symref "$SOURCE_URL" HEAD \
-            | awk '$1 == "ref:" && $3 == "HEAD" {print $2}' || true)
-          if [[ "$default_ref" != refs/heads/* ]]; then
-            default_ref=refs/heads/main
-          fi
-          awk -v d="$default_ref" '$2 == d { found=1 } END { exit !found }' upstream-refs.txt
 
           if description=$(gh api "repos/$org/$name" --jq '.description // ""' 2>/dev/null); then
             if [ "$description" != "$marker" ]; then
@@ -349,18 +364,31 @@ jobs:
             -f "default_branch=${default_ref#refs/heads/}" --silent
           git init --bare --initial-branch=main source.git
           stale_refs=()
-          delete_batch() {
-            local attempt
+          delete_refs() {
+            local -a refs=("$@")
+            local attempt midpoint
             for attempt in 1 2 3; do
-              if push_refs "${stale_refs[@]}"; then
-                stale_refs=()
+              if push_refs "${refs[@]}"; then
                 sleep 11
                 return 0
               fi
+              if (( ${#refs[@]} > 1 )); then
+                break
+              fi
               sleep "$((attempt * 15))"
             done
-            echo 'Could not remove stale Ubuntu refs.' >&2
+            if (( ${#refs[@]} > 1 )); then
+              midpoint=$(( ${#refs[@]} / 2 ))
+              delete_refs "${refs[@]:0:midpoint}"
+              delete_refs "${refs[@]:midpoint}"
+              return 0
+            fi
+            echo "Could not remove stale Ubuntu ref ${refs[0]}." >&2
             return 1
+          }
+          delete_batch() {
+            delete_refs "${stale_refs[@]}"
+            stale_refs=()
           }
           while read -r oid ref; do
             if ! awk -v r="$ref" '$2 == r { found=1 } END { exit !found }' upstream-refs.txt; then
