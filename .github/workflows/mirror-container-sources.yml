@@ -53,7 +53,7 @@ jobs:
             upstream: https://github.com/rocky-linux/sig-cloud-instance-images.git
     concurrency:
       group: mirror-${{ matrix.name }}
-      cancel-in-progress: false
+      cancel-in-progress: ${{ github.event_name == 'push' }}
     steps:
       - name: Mirror ${{ matrix.name }}
         if: ${{ matrix.name != 'Ubuntu' && (github.event_name != 'workflow_dispatch' || inputs.source == 'all' || inputs.source == matrix.name) }}
@@ -127,13 +127,16 @@ jobs:
             -F enabled=false --silent
 
           auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
-          push_ref() {
+          push_refs() {
             GIT_CONFIG_COUNT=2 \
             GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
             GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
             GIT_CONFIG_KEY_1=http.version \
             GIT_CONFIG_VALUE_1=HTTP/1.1 \
-              git -C source.git push --force "$target" "$1:$2"
+              git -C source.git push --force "$target" "$@"
+          }
+          push_ref() {
+            push_refs "$1:$2"
           }
 
           git ls-remote --refs --heads --tags "$target" \
@@ -262,13 +265,16 @@ jobs:
             -F enabled=false --silent
 
           auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
-          push_ref() {
+          push_refs() {
             GIT_CONFIG_COUNT=2 \
             GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
             GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
             GIT_CONFIG_KEY_1=http.version \
             GIT_CONFIG_VALUE_1=HTTP/1.1 \
-              git -C source.git push --force "$target" "$1:$2"
+              git -C source.git push --force "$target" "$@"
+          }
+          push_ref() {
+            push_refs "$1:$2"
           }
 
           git ls-remote --refs --heads --tags "$target" \
@@ -341,14 +347,33 @@ jobs:
 
           gh api -X PATCH "repos/$org/$name" \
             -f "default_branch=${default_ref#refs/heads/}" --silent
+          git init --bare --initial-branch=main source.git
+          stale_refs=()
+          delete_batch() {
+            local attempt
+            for attempt in 1 2 3; do
+              if push_refs "${stale_refs[@]}"; then
+                stale_refs=()
+                sleep 11
+                return 0
+              fi
+              sleep "$((attempt * 15))"
+            done
+            echo 'Could not remove stale Ubuntu refs.' >&2
+            return 1
+          }
           while read -r oid ref; do
             if ! awk -v r="$ref" '$2 == r { found=1 } END { exit !found }' upstream-refs.txt; then
-              git init --bare --initial-branch=main source.git
-              push_ref '' "$ref"
-              rm -rf source.git
-              sleep 11
+              stale_refs+=(":$ref")
+              if (( ${#stale_refs[@]} == 50 )); then
+                delete_batch
+              fi
             fi
           done < previous-refs.txt
+          if (( ${#stale_refs[@]} )); then
+            delete_batch
+          fi
+          rm -rf source.git
 
           git ls-remote --refs --heads --tags "$target" \
             | awk '{print $1, $2}' | sort > target-refs.txt
