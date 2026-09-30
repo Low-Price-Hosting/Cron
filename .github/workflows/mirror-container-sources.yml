@@ -270,3 +270,20 @@ jobs:
           git ls-remote --refs --heads --tags "$target" \
             | awk '{print $1, $2}' | sort > target-refs.txt
           diff -u local-refs.txt target-refs.txt
+
+  notify-container:
+    needs: mirror
+    if: ${{ always() && needs.mirror.result != 'cancelled' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Notify Container of source updates
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          SOURCE: ${{ inputs.source || 'all' }}
+        run: |
+          set -euo pipefail
+          test -n "${GH_TOKEN:-}"
+          jq -n --arg source "$SOURCE" \
+            '{event_type: "source-mirrors-updated", client_payload: {distribution: $source}}' \
+            | gh api -X POST repos/Low-Price-Hosting/Container/dispatches --input -
