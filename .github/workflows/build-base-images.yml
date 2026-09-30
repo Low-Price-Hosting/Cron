@@ -57,6 +57,7 @@ jobs:
           image="ghcr.io/low-price-hosting/$lower"
           mirror="https://github.com/$org/$DISTRIBUTION.git"
           source_label="https://github.com/$org/$DISTRIBUTION"
+          upstream_label=$source_label
           cd "$RUNNER_TEMP"
 
           # Keep one immutable tag per source revision. Moving version tags do not
@@ -67,6 +68,7 @@ jobs:
             if ! docker buildx imagetools inspect "$image:$immutable" >/dev/null 2>&1; then
               docker buildx build --progress=plain --platform linux/amd64 \
                 --label "org.opencontainers.image.source=$source_label" \
+                --label "org.opencontainers.image.url=$upstream_label" \
                 --label "org.opencontainers.image.revision=$revision" \
                 --file "$dockerfile" --tag "$image:$immutable" --push "$context"
             else
@@ -179,7 +181,7 @@ jobs:
             Ubuntu)
               # Ubuntu's official container source is ubuntu-base. The current
               # Ubuntu Git mirror contains livecd-rootfs, which has no Dockerfile.
-              source_label=https://git.launchpad.net/cloud-images/+oci/ubuntu-base
+              upstream_label=https://git.launchpad.net/cloud-images/+oci/ubuntu-base
               curl -fsSL https://raw.githubusercontent.com/docker-library/official-images/master/library/ubuntu > ubuntu-library
               mapfile -t releases < <(awk 'BEGIN {RS=""; FS="\n"} {tags=""; ref=""; for(i=1;i<=NF;i++) {if($i ~ /^Tags: /) {tags=$i; sub(/^Tags: /, "", tags)} if($i ~ /^amd64-GitFetch: /) {ref=$i; sub(/^amd64-GitFetch: /, "", ref)}} if(tags != "" && ref != "") print tags "|" ref}' ubuntu-library)
               ((${#releases[@]}))
@@ -221,7 +223,7 @@ jobs:
             Centos)
               # The mirrored Hyperscale SIG source is not the general CentOS
               # Stream base image. Build from the project's cloud rootfs.
-              source_label=https://cloud.centos.org/centos/
+              upstream_label=https://cloud.centos.org/centos/
               mapfile -t releases < <(curl -fsSL https://cloud.centos.org/centos/ \
                 | sed -nE 's/.*href="([0-9]+)-stream\/".*/\1/p' | sort -n)
               ((${#releases[@]}))
