@@ -1,6 +1,9 @@
 name: Mirror Linux container sources
 
 on:
+  push:
+    paths:
+      - .github/workflows/mirror-container-sources.yml
   schedule:
     - cron: '0 * * * *'
   workflow_dispatch:
@@ -53,7 +56,7 @@ jobs:
       cancel-in-progress: false
     steps:
       - name: Mirror ${{ matrix.name }}
-        if: ${{ matrix.name != 'Ubuntu' && (github.event_name == 'schedule' || inputs.source == 'all' || inputs.source == matrix.name) }}
+        if: ${{ matrix.name != 'Ubuntu' && (github.event_name != 'workflow_dispatch' || inputs.source == 'all' || inputs.source == matrix.name) }}
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN}}
@@ -215,7 +218,7 @@ jobs:
           diff -u local-refs.txt target-refs.txt
 
       - name: Mirror Ubuntu one ref at a time
-        if: ${{ matrix.name == 'Ubuntu' && (github.event_name == 'schedule' || inputs.source == 'all' || inputs.source == matrix.name) }}
+        if: ${{ matrix.name == 'Ubuntu' && (github.event_name != 'workflow_dispatch' || inputs.source == 'all' || inputs.source == matrix.name) }}
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
