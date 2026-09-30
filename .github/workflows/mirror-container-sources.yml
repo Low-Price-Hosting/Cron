@@ -102,6 +102,45 @@ jobs:
             diff -u upstream-refnames.txt local-refnames.txt
           fi
 
+          if [[ "$SOURCE_NAME" == Fedora ]]; then
+            # Fedora release branches may advance past the commit used by an
+            # active official image. Keep those published commits in the org.
+            curl -fsSL --retry 3 \
+              https://raw.githubusercontent.com/docker-library/official-images/master/library/fedora \
+              -o fedora-library
+            awk 'BEGIN { RS=""; FS="\n" }
+              {
+                version=""; commit=""; amd64=0
+                for (i=1; i<=NF; i++) {
+                  if ($i ~ /^Tags: /) {
+                    count=split(substr($i, 7), tags, ",")
+                    for (j=1; j<=count; j++) {
+                      gsub(/^[[:space:]]+|[[:space:]]+$/, "", tags[j])
+                      if (tags[j] ~ /^[0-9]+$/) version=tags[j]
+                    }
+                  }
+                  if ($i ~ /^GitCommit: /) commit=substr($i, 12)
+                  if ($i ~ /^Architectures: / && index($i, "amd64")) amd64=1
+                }
+                if (version != "" && length(commit) == 40 && amd64) print version, commit
+              }' fedora-library | sort -n -u > fedora-official-commits.txt
+            test -s fedora-official-commits.txt
+            while read -r version commit; do
+              fetched=false
+              for attempt in 1 2 3; do
+                if timeout 15m git -c protocol.version=1 -C source.git \
+                  fetch --no-tags "$SOURCE_URL" "$commit"; then
+                  fetched=true
+                  break
+                fi
+                sleep "$((attempt * 10))"
+              done
+              test "$fetched" = true
+              [[ "$(git -C source.git rev-parse FETCH_HEAD)" == "$commit" ]]
+              git -C source.git update-ref "refs/heads/official-images/$version" "$commit"
+            done < fedora-official-commits.txt
+          fi
+
           git -C source.git for-each-ref \
             --format='%(objectname) %(refname)' refs/heads refs/tags \
             | sort > local-refs.txt
