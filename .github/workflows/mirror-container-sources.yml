@@ -33,11 +33,11 @@ jobs:
       matrix:
         include:
           - name: Ubuntu
-            upstream: https://git.launchpad.net/livecd-rootfs
+            upstream: https://git.launchpad.net/cloud-images/+oci/ubuntu-base
           - name: Debian
             upstream: https://github.com/debuerreotype/docker-debian-artifacts.git
           - name: Centos
-            upstream: https://pagure.io/centos-sig-hyperscale/containers-releng.git
+            upstream: https://gitlab.com/redhat/centos-stream/release-engineering/kickstarts.git
           - name: Alpine
             upstream: https://github.com/alpinelinux/docker-alpine.git
           - name: Fedora
@@ -53,7 +53,7 @@ jobs:
       cancel-in-progress: false
     steps:
       - name: Mirror ${{ matrix.name }}
-        if: ${{ github.event_name == 'schedule' || inputs.source == 'all' || inputs.source == matrix.name }}
+        if: ${{ matrix.name != 'Ubuntu' && (github.event_name == 'schedule' || inputs.source == 'all' || inputs.source == matrix.name) }}
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN}}
@@ -140,63 +140,6 @@ jobs:
             previous_refs["$ref"]="$oid"
           done < previous-refs.txt
 
-          # Ubuntu's livecd-rootfs repository contains build code, not rootfs
-          # archives. Its many branches and tags fit in a small Git pack, so
-          # update refs in batches instead of walking every commit separately.
-          if [ "$SOURCE_NAME" = Ubuntu ]; then
-            refspecs=()
-            push_batch() {
-              local attempt
-              for attempt in 1 2 3; do
-                if GIT_CONFIG_COUNT=2 \
-                   GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
-                   GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
-                   GIT_CONFIG_KEY_1=http.version \
-                   GIT_CONFIG_VALUE_1=HTTP/1.1 \
-                     git -C source.git push "$target" "${refspecs[@]}"; then
-                  refspecs=()
-                  sleep 10
-                  return 0
-                fi
-                sleep "$((attempt * 15))"
-              done
-              echo 'Could not update Ubuntu refs.' >&2
-              return 1
-            }
-
-            while read -r oid ref; do
-              if [ "${previous_refs[$ref]:-}" != "$oid" ]; then
-                refspecs+=("+$ref:$ref")
-                if (( ${#refspecs[@]} == 100 )); then
-                  push_batch
-                fi
-              fi
-            done < local-refs.txt
-            if (( ${#refspecs[@]} )); then
-              push_batch
-            fi
-
-            gh api -X PATCH "repos/$org/$SOURCE_NAME" \
-              -f default_branch=ubuntu/master --silent
-
-            while read -r oid ref; do
-              if ! git -C source.git show-ref --verify --quiet "$ref"; then
-                refspecs+=(":$ref")
-                if (( ${#refspecs[@]} == 100 )); then
-                  push_batch
-                fi
-              fi
-            done < previous-refs.txt
-            if (( ${#refspecs[@]} )); then
-              push_batch
-            fi
-
-            git ls-remote --refs --heads --tags "$target" \
-              | awk '{print $1, $2}' | sort > target-refs.txt
-            diff -u local-refs.txt target-refs.txt
-            exit 0
-          fi
-
           # Send each ref separately. If one branch is too large for GitHub's
           # 2 GiB push limit, recursively send commits along its history.
           push_commits() {
@@ -271,9 +214,146 @@ jobs:
             | awk '{print $1, $2}' | sort > target-refs.txt
           diff -u local-refs.txt target-refs.txt
 
+      - name: Mirror Ubuntu one ref at a time
+        if: ${{ matrix.name == 'Ubuntu' && (github.event_name == 'schedule' || inputs.source == 'all' || inputs.source == matrix.name) }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          SOURCE_URL: ${{ matrix.upstream }}
+        run: |
+          set -euo pipefail
+          test -n "${GH_TOKEN:-}"
+          org=Low-Price-Hosting
+          name=Ubuntu
+          target="https://github.com/$org/$name.git"
+          marker="Managed by $org/Cron; upstream: $SOURCE_URL"
+
+          # This repository contains OCI layers in Git. Fetching every ref in
+          # one checkout exceeds the standard runner's available disk space.
+          git -c protocol.version=1 ls-remote --refs --heads --tags "$SOURCE_URL" \
+            | awk '{print $1, $2}' | sort > upstream-refs.txt
+          test -s upstream-refs.txt
+          default_ref=$(git -c protocol.version=1 ls-remote --symref "$SOURCE_URL" HEAD \
+            | awk '$1 == "ref:" && $3 == "HEAD" {print $2}' || true)
+          if [[ "$default_ref" != refs/heads/* ]]; then
+            default_ref=refs/heads/main
+          fi
+          awk -v d="$default_ref" '$2 == d { found=1 } END { exit !found }' upstream-refs.txt
+
+          if description=$(gh api "repos/$org/$name" --jq '.description // ""' 2>/dev/null); then
+            if [ "$description" != "$marker" ]; then
+              if [[ "$description" == "Managed by $org/Cron; upstream: "* ]]; then
+                gh api -X PATCH "repos/$org/$name" \
+                  -f "description=$marker" --silent
+              else
+                echo "$org/$name exists but is not a Cron-managed mirror." >&2
+                exit 1
+              fi
+            fi
+          else
+            gh api -X POST "orgs/$org/repos" \
+              -f "name=$name" -f "description=$marker" \
+              -F private=false -F auto_init=false --silent
+          fi
+          gh api -X PUT "repos/$org/$name/actions/permissions" \
+            -F enabled=false --silent
+
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          push_ref() {
+            GIT_CONFIG_COUNT=2 \
+            GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+            GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
+            GIT_CONFIG_KEY_1=http.version \
+            GIT_CONFIG_VALUE_1=HTTP/1.1 \
+              git -C source.git push --force "$target" "$1:$2"
+          }
+
+          git ls-remote --refs --heads --tags "$target" \
+            | awk '{print $1, $2}' | sort > previous-refs.txt
+          declare -A previous_refs=()
+          while read -r oid ref; do
+            previous_refs["$ref"]="$oid"
+          done < previous-refs.txt
+
+          push_commits() {
+            local first=$1 last=$2 destination=$3 middle attempt
+            if push_ref "${commits[$last]}" "$destination"; then
+              sleep 11
+              return 0
+            fi
+            if (( first == last )); then
+              for attempt in 2 3; do
+                sleep "$((attempt * 15))"
+                if push_ref "${commits[$last]}" "$destination"; then
+                  sleep 11
+                  return 0
+                fi
+              done
+              echo "A single Ubuntu commit could not be pushed to $destination." >&2
+              return 1
+            fi
+            middle=$(((first + last) / 2))
+            push_commits "$first" "$middle" "$destination"
+            push_commits "$((middle + 1))" "$last" "$destination"
+          }
+
+          awk -v d="$default_ref" '$2 == d' upstream-refs.txt > pending-refs.txt
+          awk -v d="$default_ref" '$2 != d' upstream-refs.txt >> pending-refs.txt
+          while read -r oid ref; do
+            [[ "${previous_refs[$ref]:-}" == "$oid" ]] && continue
+            echo "Updating $ref from $SOURCE_URL"
+            git init --bare --initial-branch=main source.git
+            fetched=false
+            for attempt in 1 2 3; do
+              if timeout 20m git -c protocol.version=1 -C source.git fetch \
+                --atomic --no-tags "$SOURCE_URL" "+$ref:$ref"; then
+                fetched=true
+                break
+              fi
+              sleep "$((attempt * 15))"
+            done
+            test "$fetched" = true
+            [[ "$(git -C source.git rev-parse "$ref")" == "$oid" ]]
+
+            pushed=false
+            for attempt in 1 2 3; do
+              if push_ref "$ref" "$ref"; then
+                pushed=true
+                sleep 11
+                break
+              fi
+              sleep "$((attempt * 15))"
+            done
+            if [ "$pushed" = false ]; then
+              commit=$(git -C source.git rev-parse "${ref}^{commit}")
+              mapfile -t commits < <(git -C source.git rev-list \
+                --topo-order --reverse "$commit")
+              ((${#commits[@]}))
+              push_commits 0 "$((${#commits[@]} - 1))" "$ref"
+              push_ref "$ref" "$ref"
+              sleep 11
+            fi
+            rm -rf source.git
+          done < pending-refs.txt
+
+          gh api -X PATCH "repos/$org/$name" \
+            -f "default_branch=${default_ref#refs/heads/}" --silent
+          while read -r oid ref; do
+            if ! awk -v r="$ref" '$2 == r { found=1 } END { exit !found }' upstream-refs.txt; then
+              git init --bare --initial-branch=main source.git
+              push_ref '' "$ref"
+              rm -rf source.git
+              sleep 11
+            fi
+          done < previous-refs.txt
+
+          git ls-remote --refs --heads --tags "$target" \
+            | awk '{print $1, $2}' | sort > target-refs.txt
+          diff -u upstream-refs.txt target-refs.txt
+
   notify-container:
     needs: mirror
-    if: ${{ always() && needs.mirror.result != 'cancelled' }}
+    if: ${{ needs.mirror.result == 'success' }}
     runs-on: ubuntu-24.04
     steps:
       - name: Notify Container of source updates
