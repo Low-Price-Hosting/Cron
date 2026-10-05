@@ -76,8 +76,19 @@ while read -r upstream_ref branch; do
   fi
 done < ordered-refs
 gh api -X PATCH "repos/$org/$DISTRO" -f default_branch=main --silent
+deletions=()
+leases=()
+prune_batch() {
+  ((${#deletions[@]})) || return 0
+  git -C snapshot push "${leases[@]}" "$target" "${deletions[@]}"
+  deletions=()
+  leases=()
+}
 while read -r oid ref; do
   if [[ "$ref" == refs/tags/* ]] || ! awk -v branch="${ref#refs/heads/}" '$2==branch {found=1} END {exit !found}' selected-refs; then
-    git -C snapshot push --force-with-lease="$ref:$oid" "$target" ":$ref"
+    leases+=("--force-with-lease=$ref:$oid")
+    deletions+=(":$ref")
+    if ((${#deletions[@]} == 100)); then prune_batch; fi
   fi
 done < previous-refs
+prune_batch
