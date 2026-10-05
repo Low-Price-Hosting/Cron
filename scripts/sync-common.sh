@@ -48,11 +48,12 @@ export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
 export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth"
 git ls-remote --refs --heads --tags "$target" > previous-refs
 { awk '$2=="main"' selected-refs; awk '$2!="main"' selected-refs; } > ordered-refs
-while read -r upstream_ref branch; do
+while read -r upstream_ref branch alternate_upstream; do
+  selected_upstream=${alternate_upstream:-$UPSTREAM}
   rm -rf upstream.git snapshot
   git init --bare --quiet upstream.git
   git -c protocol.version=1 -C upstream.git fetch --quiet --depth=1 --no-tags \
-    "$UPSTREAM" "refs/heads/$upstream_ref"
+    "$selected_upstream" "refs/heads/$upstream_ref"
   oid=$(git -C upstream.git rev-parse FETCH_HEAD)
   stamp=$(git -C upstream.git show -s --format=%cI FETCH_HEAD)
   mkdir snapshot
@@ -62,7 +63,7 @@ while read -r upstream_ref branch; do
   done < <(git -C upstream.git ls-tree -rz --name-only FETCH_HEAD)
   ((${#paths[@]}))
   git -C upstream.git archive FETCH_HEAD -- "${paths[@]}" | tar -xf - -C snapshot
-  jq -n --arg distribution "$DISTRO" --arg upstream "$UPSTREAM" --arg ref "$upstream_ref" --arg revision "$oid" \
+  jq -n --arg distribution "$DISTRO" --arg upstream "$selected_upstream" --arg ref "$upstream_ref" --arg revision "$oid" \
     '{schema:1,distribution:$distribution,upstream:$upstream,ref:$ref,revision:$revision}' > snapshot/.container-source.json
   cp releases.json snapshot/.container-releases.json
   git -C snapshot init --quiet --initial-branch=main
