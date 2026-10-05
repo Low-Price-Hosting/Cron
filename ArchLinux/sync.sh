@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 DISTRO=ArchLinux
-UPSTREAM=https://gitlab.archlinux.org/archlinux/archlinux-docker.git
+UPSTREAM=https://github.com/archlinux/archlinux-docker.git
 DEFAULT_REF=master
 discover_releases() { :; }
 keep_path() {

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 DISTRO=Alpine
-UPSTREAM=https://gitlab.alpinelinux.org/alpine/aports.git
+UPSTREAM=https://github.com/alpinelinux/aports.git
 DEFAULT_REF=master
 
 discover_releases() {
