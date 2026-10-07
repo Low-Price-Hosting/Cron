@@ -41,11 +41,14 @@ jobs:
     needs: sync
     # Package/security checks must continue when one upstream mirror is unavailable.
     if: always() && !cancelled()
+    concurrency:
+      group: container-release-groups
+      cancel-in-progress: false
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - name: Start Container production builds
         env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN_CLASSIC }}
           SOURCE: ${{ inputs.source || 'all' }}
         run: bash scripts/notify-container.sh
